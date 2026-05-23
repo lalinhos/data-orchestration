@@ -1,29 +1,40 @@
 # Pipeline de Orquestração PNCP
 
-Pipeline de coleta, transformação e armazenamento de dados de contratações públicas da [API do PNCP](https://pncp.gov.br), com orquestração via **Prefect** e processamento distribuído via **Apache Spark**.
+Pipeline de coleta, transformação e armazenamento de dados de contratações públicas da [API do PNCP](https://pncp.gov.br), orquestrado via **Apache Airflow** com processamento distribuído via **Apache Spark**.
 
 ## Tecnologias
 
-- **Python 3.13**
-- **Prefect** — orquestração e monitoramento das etapas do pipeline
-- **Apache Spark (PySpark 4.1.1)** — transformação e classificação dos dados
-- **MongoDB Atlas** — persistência dos dados brutos e processados
-- **Java JDK 21**
+- **Python 3.12**
+- **Apache Airflow 2.9** — orquestração e agendamento do pipeline
+- **Apache Spark (PySpark 3.5)** — transformação e agregação dos dados
+- **MongoDB Atlas** — persistência nas camadas Bronze, Silver e Gold
+- **Docker** — ambiente de execução isolado e reproduzível
+
+## Arquitetura
+
+```
+API PNCP → Bronze (raw) → Silver (processado) → Gold (agregado)
+```
+
+| Camada | Coleção MongoDB | Descrição |
+|---|---|---|
+| Bronze | `contratacoes_raw` | Dados brutos da API, sem transformação |
+| Silver | `contratacoes_processadas` | Campos selecionados, padronizados e classificados |
+| Gold | `gold_area_de_servico`, `gold_estado`, `gold_faixa_de_valor`, `gold_situacao`, `gold_por_mes` | Agregações analíticas prontas para consumo |
 
 ## Fluxo do pipeline
 
 ```
-API PNCP → MongoDB (raw) → Spark → MongoDB (processados)
+ingest_bronze → transform_silver → build_gold
 ```
 
-1. **Coleta** — percorre todas as páginas da API do PNCP com delay de 1.5s entre requisições
-2. **Armazenamento raw** — registros brutos salvos no MongoDB Atlas
-3. **Processamento Spark** — lê do MongoDB, aplica flatten, classifica por ramo do MEI e deduplica
-4. **Armazenamento processado** — dados transformados salvos no MongoDB Atlas
+1. **ingest_bronze** — coleta paginada da API do PNCP com retry automático, salva no MongoDB raw
+2. **transform_silver** — lê do Bronze, aplica flatten, classifica por ramo MEI, deduplica e salva na Silver
+3. **build_gold** — lê da Silver, executa 5 agregações por estado e salva nas coleções Gold
 
-## Classificação por ramo do MEI
+## Classificação por ramo MEI
 
-Cada contratação é classificada automaticamente com base no campo `objetoCompra`:
+Cada contratação é classificada automaticamente com base no `objeto_compra`:
 
 | Ramo | Palavras-chave detectadas |
 |---|---|
@@ -33,81 +44,56 @@ Cada contratação é classificada automaticamente com base no campo `objetoComp
 | Compras | aquisição, fornecimento, material, equipamento... |
 | Outros | demais casos |
 
-## Resiliência
+## Estrutura do projeto
 
-- Erros **5xx** do servidor PNCP: retry automático com backoff (10s, 20s)
-- Erros **de rede**: retry com backoff (5s, 10s)
-- Task de coleta com até **3 retries** automáticos pelo Prefect
+```
+├── dags/
+│   └── pncp_pipeline.py     # DAG do Airflow (3 tasks)
+├── src/
+│   ├── config.py            # URLs, parâmetros e variáveis de ambiente
+│   ├── ingestion.py         # coleta paginada da API PNCP
+│   ├── processing.py        # transformações e agregações Spark
+│   └── loading.py           # acesso ao MongoDB Atlas
+├── Dockerfile               # imagem Airflow + Java + dependências
+├── docker-compose.yaml      # webserver, scheduler e postgres
+├── requirements.txt
+└── .env                     # credenciais (não versionado)
+```
 
 ## Pré-requisitos
 
-- Python 3.13+
-- Java JDK 21
-- Conexão com internet (API PNCP + MongoDB Atlas)
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 
 ## Configuração
 
-Execute uma única vez para criar o ambiente virtual e instalar as dependências:
+Crie um arquivo `.env` na raiz do projeto:
 
-```powershell
-.\setup_venv.ps1
+```env
+MONGO_URI=mongodb+srv://<usuario>:<senha>@<cluster>.mongodb.net/?appName=<app>
+MONGO_DB=pncp
 ```
 
 ## Como rodar
 
-```powershell
-.\rodar.ps1
+```bash
+# Primeira vez — inicializa o banco do Airflow e cria o usuário admin
+docker-compose up airflow-init
+
+# Sobe o ambiente completo
+docker-compose up
 ```
 
-Com parâmetros personalizados:
+Acesse o dashboard em **http://localhost:8080** com `admin` / `admin`.
 
-```powershell
-.\rodar.ps1 -DataInicial 20260401 -DataFinal 20260430 -UF PE -Modalidade 8
+O DAG `pncp_pipeline` roda automaticamente todos os dias. Para disparar manualmente:
+
+```bash
+docker-compose exec scheduler airflow dags trigger pncp_pipeline
 ```
 
-Ou diretamente pelo Python:
+## Resiliência
 
-```powershell
-python main.py --data-inicial 20260401 --data-final 20260430 --uf PE --modalidade 8
-```
-
-### Parâmetros disponíveis
-
-| Parâmetro | Padrão | Descrição |
-|---|---|---|
-| `--data-inicial` | obrigatório | Formato AAAAMMDD |
-| `--data-final` | obrigatório | Formato AAAAMMDD |
-| `--uf` | `PE` | Sigla do estado |
-| `--modalidade` | `8` | Código da modalidade (8 = Dispensa) |
-| `--tamanho-pagina` | `20` | Registros por página (máx. 500) |
-| `--sem-resumo` | — | Suprime o resumo estatístico no console |
-
-## Estrutura do projeto
-
-```
-├── main.py              # entrypoint CLI
-├── rodar.ps1            # script de execução completa (Windows)
-├── setup_venv.ps1       # configuração inicial do ambiente
-├── requirements.txt
-└── src/
-    ├── config.py        # URLs, parâmetros e constantes
-    ├── ingestion.py     # coleta paginada da API PNCP
-    ├── processing.py    # transformações Spark
-    ├── database.py      # acesso ao MongoDB Atlas
-    └── orchestration.py # tasks e flow Prefect
-```
-
-## Coleções MongoDB
-
-| Coleção | Conteúdo |
-|---|---|
-| `contratacoes_raw` | Dados brutos da API, sem transformação |
-| `contratacoes_processadas` | Dados com `ramo_mei`, campos selecionados e deduplicados |
-
-Ambas usam upsert por `numeroControlePNCP` — rodar o pipeline duas vezes não duplica registros.
-
-## Evidências de execução
-
-> Pipeline executado com sucesso — 3 tasks concluídas, dados coletados, processados pelo Spark e persistidos no MongoDB Atlas.
-
-<!-- Adicione os prints aqui colando as imagens diretamente no editor do GitHub -->
+- Erros **5xx** da API: retry com backoff (10s, 20s)
+- Erros de **rede/timeout**: retry com backoff (5s, 10s)
+- Cada task do Airflow tem **2 retries** automáticos com intervalo de 5 minutos
+- Upsert por `numero_controle_pncp` — executar o pipeline duas vezes não duplica registros
