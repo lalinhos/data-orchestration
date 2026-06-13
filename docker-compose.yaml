@@ -1,5 +1,11 @@
 x-airflow-common: &airflow-common
   build: .
+  user: "0:0"
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "50m"
+      max-file: "5"
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
@@ -7,13 +13,19 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__WEBSERVER__SECRET_KEY: 'pncp-secret-key'
+    AIRFLOW__SCHEDULER__SCHEDULER_ZOMBIE_TASK_THRESHOLD: '450'
+    AIRFLOW__LOG_RETENTION_DAYS: '7'
     PYTHONPATH: /opt/airflow
     MONGO_URI: ${MONGO_URI}
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   volumes:
     - ./dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
+    - ./workers:/opt/airflow/workers
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
+  networks:
+    - pncp-network
   depends_on:
     postgres:
       condition: service_healthy
@@ -31,6 +43,8 @@ services:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 5s
       retries: 5
+    networks:
+      - pncp-network
 
   airflow-init:
     <<: *airflow-common
@@ -51,3 +65,8 @@ services:
 
 volumes:
   postgres-data:
+
+networks:
+  pncp-network:
+    external: true
+    name: pncp-network

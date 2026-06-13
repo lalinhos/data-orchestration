@@ -1,84 +1,85 @@
 import time
 import requests
-from src.config import BASE_URL, DEFAULT_PARAMS
-
-TIMEOUT = (10, 15)
 
 
-def _build_params(data_inicial: str, data_final: str, modalidade: int, uf: str | None, pagina: int, tamanho: int) -> dict:
-    params = {
-        "dataInicial": data_inicial,
-        "dataFinal": data_final,
-        "codigoModalidadeContratacao": modalidade,
-        "pagina": pagina,
-        "tamanhoPagina": tamanho,
-    }
-    if uf:
-        params["uf"] = uf.upper()
-    return params
+class PNCPClient:
+    """Cliente HTTP para a API de Consultas do PNCP, com retry e tratamento de erros."""
 
+    def __init__(self, base_url: str, timeout: tuple[int, int] = (10, 15), tentativas: int = 3):
+        self.base_url = base_url
+        self.timeout = timeout
+        self.tentativas = tentativas
+        self._session = requests.Session()
 
-def _fetch_page(
-    session: requests.Session,
-    data_inicial: str,
-    data_final: str,
-    modalidade: int,
-    uf: str | None,
-    pagina: int,
-    tamanho: int,
-    tentativas: int = 3,
-) -> dict:
-    params = _build_params(data_inicial, data_final, modalidade, uf, pagina, tamanho)
-    for tentativa in range(1, tentativas + 1):
-        try:
-            response = session.get(BASE_URL, params=params, timeout=TIMEOUT)
-            response.raise_for_status()
+    def fetch_page(self, params: dict) -> dict:
+        pagina = params.get("pagina")
+        last_exc: Exception | None = None
+
+        for tentativa in range(1, self.tentativas + 1):
             try:
-                return response.json()
-            except ValueError:
-                # Resposta vazia — sem dados para este periodo/UF, nao adianta tentar de novo
-                return {}
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            print(f"  [TIMEOUT/REDE] pagina {pagina} (tentativa {tentativa}/{tentativas}): {e}")
-            if tentativa < tentativas:
-                espera = 10 * tentativa
-                print(f"  aguardando {espera}s...")
-                time.sleep(espera)
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response is not None else 0
-            if status < 500:
-                return {}
-            print(f"  [ERRO HTTP {status}] pagina {pagina}: {e}")
-            if tentativa < tentativas:
-                time.sleep(10 * tentativa)
-        except requests.exceptions.RequestException as e:
-            print(f"  [ERRO REDE] pagina {pagina} (tentativa {tentativa}/{tentativas}): {e}")
-            if tentativa < tentativas:
-                time.sleep(5 * tentativa)
-    return {}
+                response = self._session.get(self.base_url, params=params, timeout=self.timeout)
+                response.raise_for_status()
+                try:
+                    return response.json()
+                except ValueError:
+                    return {}
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                last_exc = e
+                print(f"  [TIMEOUT/REDE] pagina {pagina} (tentativa {tentativa}/{self.tentativas}): {e}")
+                if tentativa < self.tentativas:
+                    espera = 10 * tentativa
+                    print(f"  aguardando {espera}s...")
+                    time.sleep(espera)
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else 0
+                if status < 500:
+                    print(f"  [ERRO HTTP {status}] pagina {pagina}: {e.response.text[:200] if e.response is not None else ''}")
+                    return {}
+                last_exc = e
+                print(f"  [ERRO HTTP {status}] pagina {pagina}: {e}")
+                if tentativa < self.tentativas:
+                    time.sleep(10 * tentativa)
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                print(f"  [ERRO REDE] pagina {pagina} (tentativa {tentativa}/{self.tentativas}): {e}")
+                if tentativa < self.tentativas:
+                    time.sleep(5 * tentativa)
+
+        raise last_exc
 
 
-def iter_pages(
-    data_inicial: str,
-    data_final: str,
-    modalidade: int = DEFAULT_PARAMS["codigoModalidadeContratacao"],
-    uf: str | None = None,
-    tamanho: int = DEFAULT_PARAMS["tamanhoPagina"],
-    delay_segundos: float = 1.5,
-):
-    session = requests.Session()
+class ContratacoesExtractor:
+    """Extrator de contratações do PNCP: monta os parâmetros de busca e percorre a paginação."""
 
-    primeira = _fetch_page(session, data_inicial, data_final, modalidade, uf, 1, tamanho)
-    if not primeira:
-        return
+    def __init__(self, client: PNCPClient, modalidade: int, tamanho: int = 50):
+        self.client = client
+        self.modalidade = modalidade
+        self.tamanho = tamanho
 
-    total_paginas = primeira.get("totalPaginas", 1)
-    total_registros = primeira.get("totalRegistros", 0)
-    print(f"Total de registros: {total_registros} | Total de paginas: {total_paginas}")
+    def _build_params(self, data_inicial: str, data_final: str, uf: str | None, pagina: int) -> dict:
+        params = {
+            "dataInicial": data_inicial,
+            "dataFinal": data_final,
+            "codigoModalidadeContratacao": self.modalidade,
+            "pagina": pagina,
+            "tamanhoPagina": self.tamanho,
+        }
+        if uf:
+            params["uf"] = uf.upper()
+        return params
 
-    yield 1, total_paginas, primeira.get("data", [])
+    def iter_pages(self, data_inicial: str, data_final: str, uf: str | None = None, delay_segundos: float = 1.5):
+        primeira = self.client.fetch_page(self._build_params(data_inicial, data_final, uf, 1))
+        if not primeira:
+            return
 
-    for pagina in range(2, total_paginas + 1):
-        time.sleep(delay_segundos)
-        resultado = _fetch_page(session, data_inicial, data_final, modalidade, uf, pagina, tamanho)
-        yield pagina, total_paginas, resultado.get("data", [])
+        total_paginas = primeira.get("totalPaginas", 1)
+        total_registros = primeira.get("totalRegistros", 0)
+        print(f"Total de registros: {total_registros} | Total de paginas: {total_paginas}")
+
+        yield 1, total_paginas, primeira.get("data", [])
+
+        for pagina in range(2, total_paginas + 1):
+            time.sleep(delay_segundos)
+            resultado = self.client.fetch_page(self._build_params(data_inicial, data_final, uf, pagina))
+            yield pagina, total_paginas, resultado.get("data", [])

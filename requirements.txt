@@ -3,3 +3,4 @@ pymongo[srv]>=4.7
 certifi
 requests>=2.31.0
 pandas>=2.0.0
+confluent-kafka>=2.3.0
